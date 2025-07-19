@@ -1,0 +1,156 @@
+// Load environment variables from .env file
+
+const express = require('express');
+const path = require('path');
+const WebSocket = require('ws'); // WebSocket library
+const http = require('http'); // Required for WebSocket server
+const JSONStream = require('jsonstream'); // Import JSONStream
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// Retrieve API key from environment variables
+const apiKey = process.env.GEMINI_API_KEY || '';
+
+// Create an HTTP server from the Express app
+const server = http.createServer(app);
+
+// Create a WebSocket server instance
+const wss = new WebSocket.Server({ server });
+
+// Middleware to parse JSON request bodies
+app.use(express.json());
+
+// Serve static files from the 'public' directory
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Explicitly serve index.html for the root path
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+
+// WebSocket connection handling
+wss.on('connection', (ws) => {
+    console.log('Client connected via WebSocket');
+
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            const userPrompt = data.prompt;
+
+            if (!userPrompt) {
+                ws.send(JSON.stringify({ error: 'Prompt is required.' }));
+                ws.close(1008, 'Prompt required');
+                return;
+            }
+
+            console.log('Received prompt:', userPrompt);
+
+            const chatHistory = [{ role: "user", parts: [{ text: userPrompt }] }];
+            const payload = { contents: chatHistory };
+
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?key=${apiKey}`;
+
+            console.log('Making LLM API call to:', apiUrl);
+            console.log('LLM Request Payload:', JSON.stringify(payload, null, 2));
+
+            const llmResponse = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!llmResponse.ok) {
+                const errorBody = await llmResponse.text();
+                console.error('LLM API HTTP Error:', llmResponse.status, errorBody);
+                ws.send(`Error from AI service: ${llmResponse.status} - ${errorBody}`);
+                ws.close(1011, 'LLM API Error');
+                return;
+            }
+
+            let receivedContent = false; // Flag to track if any content was received
+
+            // Create a JSONStream parser that emits each top-level object
+            const parser = JSONStream.parse('*');
+
+            // Pipe the LLM response body through the JSONStream parser
+            // Node.js fetch response.body is a ReadableStream, which can be piped.
+            llmResponse.body
+                .pipeThrough(new TextDecoderStream()) // Decode bytes to text
+                .pipeThrough(new TransformStream({ // Custom transform to handle partial JSONs for JSONStream
+                    transform(chunk, controller) {
+                        controller.enqueue(chunk);
+                    }
+                }))
+                .pipeTo(new WritableStream({ // Write to a WritableStream that feeds JSONStream
+                    write(chunk) {
+                        parser.write(chunk);
+                    },
+                    close() {
+                        parser.end();
+                    },
+                    abort(err) {
+                        parser.emit('error', err);
+                    }
+                }));
+
+            // Listen for parsed objects from JSONStream
+            parser.on('data', (parsedChunk) => {
+                console.log('Parsed LLM object:', JSON.stringify(parsedChunk, null, 2));
+
+                if (parsedChunk.candidates && parsedChunk.candidates.length > 0 &&
+                    parsedChunk.candidates[0].content && parsedChunk.candidates[0].content.parts &&
+                    parsedChunk.candidates[0].content.parts.length > 0) {
+                    const streamedText = parsedChunk.candidates[0].content.parts[0].text;
+                    if (streamedText && ws.readyState === WebSocket.OPEN) {
+                        ws.send(streamedText); // Send each extracted text part to the client
+                        receivedContent = true;
+                    }
+                } else if (parsedChunk.error) {
+                    console.error('LLM Stream Error within parsed object:', parsedChunk.error);
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(`Error during AI streaming: ${parsedChunk.error.message}`);
+                    }
+                }
+            });
+
+            parser.on('end', () => {
+                console.log('JSONStream parser ended.');
+                if (!receivedContent) {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send('No content generated by AI for the given prompt.');
+                    }
+                }
+                ws.close(); // Close WebSocket connection after stream ends
+            });
+
+            parser.on('error', (err) => {
+                console.error('JSONStream parsing error:', err);
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(`Error parsing AI response stream: ${err.message}`);
+                }
+                ws.close(1011, 'LLM Parsing Error');
+            });
+
+        } catch (error) {
+            console.error('WebSocket message processing error:', error);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(`Error processing prompt: ${error.message}`);
+            }
+            ws.close(1011, 'Internal server error');
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('Client disconnected from WebSocket');
+    });
+
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+    });
+});
+
+// Start the HTTP server (which also serves WebSockets)
+server.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+});
